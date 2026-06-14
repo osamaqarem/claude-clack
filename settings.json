@@ -5,5 +5,6 @@
   "min": 3,
   "max": 30,
   "gap_min_ms": 45,
-  "gap_max_ms": 110
+  "gap_max_ms": 110,
+  "prompt_sound": true
 }

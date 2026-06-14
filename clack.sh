@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 #
-# claude-clack — a Claude Code PostToolUse hook that plays a keyboard-clack burst
-# when Claude edits a file. Claude waits for the hook to exit, so it returns
-# immediately and re-execs itself detached as a "burst worker". All tuning lives
+# claude-clack — a Claude Code hook that plays keyboard sounds as Claude works.
+# Sound type is chosen by the hook event that invoked it:
+#   • typing — a clack burst after a successful edit   (PostToolUse)
+#   • prompt — a quack when Claude asks for your input (Notification)
+# Every hook entry is registered with "async": true, so Claude Code does not wait
+# for us — it runs this script in the background to completion. We therefore play
+# everything synchronously inline; no re-exec / detach is needed. All tuning lives
 # in settings.json next to this script.
 
 # A hook must never change the tool's exit status; nothing below is allowed to fail.
 set +e
 
-MODE="${1:-}"
-
-# Resolve our own directory (following symlinks) so we work regardless of cwd.
 SOURCE="${BASH_SOURCE[0]}"
 while [ -h "$SOURCE" ]; do
   DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
@@ -18,11 +19,9 @@ while [ -h "$SOURCE" ]; do
   [ "${SOURCE:0:1}" = "/" ] || SOURCE="$DIR/$SOURCE"
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
-SELF="$SCRIPT_DIR/$(basename "$SOURCE")"
 ASSETS_DIR="$SCRIPT_DIR/assets"
 CONFIG="$SCRIPT_DIR/settings.json"
 
-# cfg KEY DEFAULT -> value for KEY from the flat JSON settings.json, else DEFAULT.
 cfg() {
   local key="$1" def="$2" val
   [ -f "$CONFIG" ] || { printf '%s' "$def"; return; }
@@ -31,7 +30,6 @@ cfg() {
   if [ -n "$val" ]; then printf '%s' "$val"; else printf '%s' "$def"; fi
 }
 
-# intval VALUE DEFAULT -> VALUE if a non-negative integer, else DEFAULT.
 intval() {
   case "$1" in ""|*[!0-9]*) printf '%s' "$2" ;; *) printf '%s' "$1" ;; esac
 }
@@ -47,8 +45,7 @@ GAP_MAX="$(intval "$(cfg gap_max_ms 110)" 110)"
 [ "$GAP_MAX" -lt "$GAP_MIN" ] && GAP_MAX="$GAP_MIN"
 FIXED_COUNT="$(cfg count "")"
 
-# Player is auto-detected, not configurable. aplay has no volume flag (ALSA
-# volume is the system mixer), so `volume` applies to afplay only.
+# aplay has no volume flag (ALSA uses the system mixer); `volume` is afplay-only.
 if command -v afplay >/dev/null 2>&1; then
   PLAY_CMD=(afplay -v "$VOLUME")
 elif command -v aplay >/dev/null 2>&1; then
@@ -57,14 +54,17 @@ else
   exit 0
 fi
 
+play_one() {
+  [ -f "$1" ] && "${PLAY_CMD[@]}" "$1" </dev/null >/dev/null 2>&1
+  exit 0
+}
+
 # nullglob isn't portable to macOS's bash 3.2, so guard the no-match case.
 shopt -s nullglob 2>/dev/null
 SOUNDS=("$ASSETS_DIR"/clack*.wav)
 N="${#SOUNDS[@]}"
-[ "$N" -gt 0 ] || exit 0
 
-# Unbiased integer in [0, N): reject the top of $RANDOM's range so the modulo is
-# uniform even when N does not divide 32768.
+# Reject the top of $RANDOM's range so the modulo is unbiased when N ∤ 32768.
 rand_below() {
   local n="$1" limit r
   limit=$(( 32768 - (32768 % n) ))
@@ -73,39 +73,37 @@ rand_below() {
   echo $(( r % n ))
 }
 
-# Worker mode: play the burst, then exit. Detached, so blocking here never delays
-# Claude. The launcher passes the clack count as $2.
-if [ "$MODE" = "__burst" ]; then
-  COUNT="$(intval "${2:-}" 8)"
-  [ "$COUNT" -lt 1 ] && COUNT=1
-  GAP_SPAN=$(( GAP_MAX - GAP_MIN + 1 ))
-
-  i=0
-  while [ "$i" -lt "$COUNT" ]; do
-    SOUND="${SOUNDS[$(rand_below "$N")]}"
-    # Background each clack so keystrokes can overlap slightly, like a real keyboard.
-    [ -f "$SOUND" ] && "${PLAY_CMD[@]}" "$SOUND" </dev/null >/dev/null 2>&1 &
-    i=$(( i + 1 ))
-    if [ "$i" -lt "$COUNT" ]; then
-      GAP_MS=$(( GAP_MIN + $(rand_below "$GAP_SPAN") ))
-      sleep "$(printf '0.%03d' "$GAP_MS")"
-    fi
-  done
-  wait
-  exit 0
-fi
-
-# Launcher mode. Read stdin fully (also drains the event so the writer can't block).
+# Drain stdin fully so the writer can't block.
 EVENT="$(cat 2>/dev/null)"
+
+# grep the FULL event and take the FIRST match: that's the genuine top-level
+# hook_event_name, which precedes tool_input; any copy inside user edit text comes
+# later and is JSON-escaped (so this pattern won't match it). A fixed-length prefix
+# would misclassify when hook_event_name sits past it behind a large field.
+EVENT_NAME="$(printf '%s' "$EVENT" \
+  | grep -oEm1 '"hook_event_name"[[:space:]]*:[[:space:]]*"[^"]*"' \
+  | sed -E 's/.*"([^"]*)"$/\1/')"
+
+case "$EVENT_NAME" in
+  Notification)
+    # Quack only fires here for the notification types the matcher allows
+    # (settings.json restricts this hook to permission_prompt).
+    [ "$(cfg prompt_sound true)" = "true" ] && play_one "$ASSETS_DIR/quack.wav"
+    exit 0 ;;
+  PostToolUse|"") ;;
+  *) exit 0 ;;
+esac
 
 if [ -n "$FIXED_COUNT" ] && [ -z "${FIXED_COUNT//[0-9]/}" ]; then
   COUNT="$FIXED_COUNT"
 else
-  # Sum the lengths of inserted-text fields (content / new_string / new_source).
-  # awk walks the JSON purely as data — no shell eval — and stops early once the
-  # count would already hit MAX, so a huge file write isn't scanned to the end.
+  # awk walks the JSON as data (no shell eval), summing inserted-text fields and
+  # stopping early at MAX. The INPUT is bounded to an 8 KB prefix: the per-char scan
+  # is slow, and a large non-wanted field (e.g. old_string/tool_response before
+  # new_string) would otherwise be scanned in full. 8 KB covers the preamble + a
+  # typical edit; past it we under-count.
   CAP=$(( (MAX + 1) * CPC ))
-  CHARS="$(printf '%s' "$EVENT" | awk -v cap="$CAP" '
+  CHARS="$(printf '%s' "${EVENT:0:8192}" | awk -v cap="$CAP" '
     function wanted(k) { return (k == "content" || k == "new_string" || k == "new_source") }
     { d = d $0 "\n" }
     END {
@@ -145,13 +143,19 @@ else
 fi
 [ "$COUNT" -lt 1 ] && COUNT=1
 
-# Detach so the burst outlives this script. setsid gives its own session
-# (survives a group SIGTERM, not just SIGHUP); nohup is the fallback.
-if command -v setsid >/dev/null 2>&1; then
-  setsid "$SELF" __burst "$COUNT" </dev/null >/dev/null 2>&1 &
-else
-  nohup "$SELF" __burst "$COUNT" </dev/null >/dev/null 2>&1 &
-fi
-disown 2>/dev/null
-
+# Play the clack burst synchronously: async hooks run to completion in the
+# background, so blocking here for the ~1-2s burst doesn't stall Claude.
+[ "$N" -gt 0 ] || exit 0
+GAP_SPAN=$(( GAP_MAX - GAP_MIN + 1 ))
+i=0
+while [ "$i" -lt "$COUNT" ]; do
+  SOUND="${SOUNDS[$(rand_below "$N")]}"
+  [ -f "$SOUND" ] && "${PLAY_CMD[@]}" "$SOUND" </dev/null >/dev/null 2>&1 &
+  i=$(( i + 1 ))
+  if [ "$i" -lt "$COUNT" ]; then
+    GAP_MS=$(( GAP_MIN + $(rand_below "$GAP_SPAN") ))
+    sleep "$(printf '0.%03d' "$GAP_MS")"
+  fi
+done
+wait
 exit 0
